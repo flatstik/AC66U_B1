@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ville Takio <ville+git@takio.fi>
+Date: Thu, 5 Nov 2026 12:39:56 +0200
+Subject: [PATCH] wifi: b43: one DMA descriptor per TX frame
+
+b43 hands each frame to the DMA engine as two descriptors: the TX header
+from txhdr_cache, then the frame. On core rev 30 (BCM43217) the TX engine
+then underflows FIFO 1 on nearly every A-MPDU, at any rate (MCS 0 too):
+about 1500 underflows per 6 s, so most MPDUs have to be sent again and
+TCP download stays at 1-7 Mbit/s. Frames sent on their own do not
+underflow. The vendor driver hands each frame over as one buffer with
+one descriptor, and with 32-byte aligned headers the two descriptors
+still underflow, so it is the split itself.
+
+Put the TX header into the headroom in front of the frame instead, and
+map the frame with one descriptor: hw->extra_tx_headroom asks mac80211
+for the room, and skb_cow_head() makes it if a frame comes without it.
+Every TX completion takes the header off again before the frame goes
+back to mac80211 or is sent again, and b43_dma_txhdr() returns the header
+in front of the frame, so the A-MPDU length and last-MPDU fixups still
+reach what the hardware reads.
+
+On the RT-AC56U (with the gain control fix), HT20, 2x2 client: no more
+underflows; TCP download goes from 1-7 to 80-95 Mbit/s, 10 minutes stable.
+
+Only tested on core rev 30. The ring now holds one frame per slot.
+
+Signed-off-by: Ville Takio <ville+git@takio.fi>
+---
+ drivers/net/wireless/broadcom/b43/dma.c  | 143 +++++++++++------------
+ drivers/net/wireless/broadcom/b43/dma.h  |   2 +
+ drivers/net/wireless/broadcom/b43/main.c |   2 +
+ 3 files changed, 74 insertions(+), 73 deletions(-)
+
+--- a/drivers/net/wireless/broadcom/b43/dma.c
++++ b/drivers/net/wireless/broadcom/b43/dma.c
+@@ -33,7 +33,7 @@
+ /* Required number of TX DMA slots per TX frame.
+  * This currently is 2, because we put the header and the ieee80211 frame
+  * into separate slots. */
+-#define TX_SLOTS_PER_FRAME	2
++#define TX_SLOTS_PER_FRAME	1
+ 
+ static u32 b43_dma_address(struct b43_dma *dma, dma_addr_t dmaaddr,
+ 			   enum b43_addrtype addrtype)
+@@ -800,6 +800,25 @@ static void dmacontroller_cleanup(struct
+ 	}
+ }
+ 
++/* Unmap a TX frame and take its TX header off the front of the skb again,
++ * so the skb is the frame mac80211 handed over.
++ */
++static void b43_dma_tx_unmap(struct b43_dmaring *ring,
++			     struct b43_dmadesc_meta *meta)
++{
++	struct sk_buff *skb = meta->skb;
++	struct b43_private_tx_info *priv_info =
++		b43_get_priv_tx_info(IEEE80211_SKB_CB(skb));
++
++	unmap_descbuffer(ring, meta->dmaaddr, skb->len, 1);
++	kfree(priv_info->bouncebuffer);
++	priv_info->bouncebuffer = NULL;
++	if (meta->hdr_pushed) {
++		skb_pull(skb, b43_txhdr_size(ring->dev));
++		meta->hdr_pushed = false;
++	}
++}
++
+ static void free_all_descbuffers(struct b43_dmaring *ring)
+ {
+ 	struct b43_dmadesc_meta *meta;
+@@ -816,6 +835,8 @@ static void free_all_descbuffers(struct
+ 			continue;
+ 		}
+ 		if (ring->tx)
++			b43_dma_tx_unmap(ring, meta);
++		else
+ 			unmap_descbuffer(ring, meta->dmaaddr,
+ 					 meta->skb->len, 1);
+ 		free_descriptor_buffer(ring, meta);
+@@ -1233,49 +1254,36 @@ static int dma_tx_fragment(struct b43_dm
+ 	int err;
+ 	struct b43_dmadesc_generic *desc;
+ 	struct b43_dmadesc_meta *meta;
+-	struct b43_dmadesc_meta *meta_hdr;
+ 	u16 cookie;
+ 	size_t hdrsize = b43_txhdr_size(ring->dev);
+ 
+-	/* Important note: If the number of used DMA slots per TX frame
+-	 * is changed here, the TX_SLOTS_PER_FRAME definition at the top of
+-	 * the file has to be updated, too!
++	/* One slot and one descriptor per frame: the TX header goes into the
++	 * headroom in front of the frame. On core rev 30 (BCM43217) the TX
++	 * engine underflows on nearly every A-MPDU when each MPDU comes as a
++	 * header descriptor and a frame descriptor; wl also hands each frame
++	 * over as one buffer. If the number of slots per frame changes here,
++	 * TX_SLOTS_PER_FRAME has to change too.
+ 	 */
+-
+ 	old_top_slot = ring->current_slot;
+ 	old_used_slots = ring->used_slots;
+ 
+-	/* Get a slot for the header. */
+-	slot = request_slot(ring);
+-	desc = ops->idx2desc(ring, slot, &meta_hdr);
+-	memset(meta_hdr, 0, sizeof(*meta_hdr));
+-
+-	header = &(ring->txhdr_cache[(slot / TX_SLOTS_PER_FRAME) * hdrsize]);
+-	cookie = generate_cookie(ring, slot);
+-	err = b43_generate_txhdr(ring->dev, header,
+-				 skb, info, cookie);
+-	if (unlikely(err)) {
+-		ring->current_slot = old_top_slot;
+-		ring->used_slots = old_used_slots;
+-		return err;
+-	}
+-
+-	meta_hdr->dmaaddr = map_descbuffer(ring, (unsigned char *)header,
+-					   hdrsize, 1);
+-	if (b43_dma_mapping_error(ring, meta_hdr->dmaaddr, hdrsize, 1)) {
+-		ring->current_slot = old_top_slot;
+-		ring->used_slots = old_used_slots;
+-		return -EIO;
+-	}
+-	ops->fill_descriptor(ring, desc, meta_hdr->dmaaddr,
+-			     hdrsize, 1, 0, 0);
+-
+-	/* Get a slot for the payload. */
+ 	slot = request_slot(ring);
+ 	desc = ops->idx2desc(ring, slot, &meta);
+ 	memset(meta, 0, sizeof(*meta));
+ 
++	header = &ring->txhdr_cache[slot * hdrsize];
++	cookie = generate_cookie(ring, slot);
++	err = b43_generate_txhdr(ring->dev, header, skb, info, cookie);
++	if (unlikely(err))
++		goto out_restore;
++
++	err = skb_cow_head(skb, hdrsize);
++	if (unlikely(err))
++		goto out_restore;
++	memcpy(skb_push(skb, hdrsize), header, hdrsize);
++
+ 	meta->skb = skb;
++	meta->hdr_pushed = true;
+ 	meta->is_last_fragment = true;
+ 	priv_info->bouncebuffer = NULL;
+ 
+@@ -1285,24 +1293,20 @@ static int dma_tx_fragment(struct b43_dm
+ 		priv_info->bouncebuffer = kmemdup(skb->data, skb->len,
+ 						  GFP_ATOMIC | GFP_DMA);
+ 		if (!priv_info->bouncebuffer) {
+-			ring->current_slot = old_top_slot;
+-			ring->used_slots = old_used_slots;
+ 			err = -ENOMEM;
+-			goto out_unmap_hdr;
++			goto out_pull;
+ 		}
+ 
+ 		meta->dmaaddr = map_descbuffer(ring, priv_info->bouncebuffer, skb->len, 1);
+ 		if (b43_dma_mapping_error(ring, meta->dmaaddr, skb->len, 1)) {
+ 			kfree(priv_info->bouncebuffer);
+ 			priv_info->bouncebuffer = NULL;
+-			ring->current_slot = old_top_slot;
+-			ring->used_slots = old_used_slots;
+ 			err = -EIO;
+-			goto out_unmap_hdr;
++			goto out_pull;
+ 		}
+ 	}
+ 
+-	ops->fill_descriptor(ring, desc, meta->dmaaddr, skb->len, 0, 1, 1);
++	ops->fill_descriptor(ring, desc, meta->dmaaddr, skb->len, 1, 1, 1);
+ 
+ 	if (info->flags & IEEE80211_TX_CTL_SEND_AFTER_DTIM) {
+ 		/* Tell the firmware about the cookie of the last
+@@ -1318,9 +1322,13 @@ static int dma_tx_fragment(struct b43_dm
+ 	}
+ 	return 0;
+ 
+-out_unmap_hdr:
+-	unmap_descbuffer(ring, meta_hdr->dmaaddr,
+-			 hdrsize, 1);
++out_pull:
++	skb_pull(skb, hdrsize);
++	meta->skb = NULL;
++	meta->hdr_pushed = false;
++out_restore:
++	ring->current_slot = old_top_slot;
++	ring->used_slots = old_used_slots;
+ 	return err;
+ }
+ 
+@@ -1454,9 +1462,20 @@ out:
+ static struct b43_txhdr *b43_dma_txhdr(struct b43_dmaring *ring, int slot)
+ {
+ 	size_t hdrsize = b43_txhdr_size(ring->dev);
++	struct b43_dmadesc_meta *meta;
+ 
+-	return (struct b43_txhdr *)
+-		&ring->txhdr_cache[(slot / TX_SLOTS_PER_FRAME) * hdrsize];
++	ring->ops->idx2desc(ring, slot, &meta);
++	if (meta->hdr_pushed && meta->skb &&
++	    !b43_dma_ptr_is_poisoned(meta->skb)) {
++		struct b43_private_tx_info *priv_info =
++			b43_get_priv_tx_info(IEEE80211_SKB_CB(meta->skb));
++
++		/* The copy the hardware reads */
++		if (priv_info->bouncebuffer)
++			return priv_info->bouncebuffer;
++		return (struct b43_txhdr *)meta->skb->data;
++	}
++	return (struct b43_txhdr *)&ring->txhdr_cache[slot * hdrsize];
+ }
+ 
+ static void b43_dma_sync_txhdr(struct b43_dmaring *ring, int slot)
+@@ -1683,16 +1702,13 @@ static bool b43_dma_complete_ampdu_frame
+ {
+ 	struct sk_buff *skb = meta->skb;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+-	struct b43_private_tx_info *priv_info = b43_get_priv_tx_info(info);
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+ 	bool acked = b43_dma_ampdu_frame_acked(status, skb);
+ 	unsigned int resend;
+ 	struct b43_sta *bsta;
+ 	int i;
+ 
+-	unmap_descbuffer(ring, meta->dmaaddr, skb->len, 1);
+-	kfree(priv_info->bouncebuffer);
+-	priv_info->bouncebuffer = NULL;
++	/* b43_dma_tx_unmap() was called: skb is the frame again */
+ 	meta->skb = B43_DMA_PTR_POISON;
+ 
+ 	resend = acked ? 0 : b43_dma_ampdu_may_retry(dev, skb);
+@@ -1912,7 +1928,6 @@ static void b43_dma_handle_ampdu_txstatu
+ 					  const struct b43_txstatus *status)
+ {
+ 	const struct b43_dma_ops *ops = ring->ops;
+-	size_t hdrsize = b43_txhdr_size(dev);
+ 	struct b43_dmadesc_meta *meta;
+ 	struct sk_buff_head retry, *queue;
+ 	struct ieee80211_tx_info first = {};
+@@ -1927,26 +1942,16 @@ static void b43_dma_handle_ampdu_txstatu
+ 		ring->ampdu_inflight--;
+ 	rcu_read_lock();
+ 	do {
+-		/* Header slot */
+-		ops->idx2desc(ring, slot, &meta);
+-		if (unlikely(meta->skb)) {
+-			b43dbg(dev->wl, "A-MPDU TX status: no header at slot %d on ring %d\n",
+-			       slot, ring->index);
+-			break;
+-		}
+-		last = (le32_to_cpu(b43_dma_txhdr(ring, slot)->mac_ctl) &
+-			B43_TXH_MAC_AMPDU) == B43_TXH_MAC_AMPDU_LAST;
+-		unmap_descbuffer(ring, meta->dmaaddr, hdrsize, 1);
+-		ring->used_slots--;
+-
+-		/* Payload slot */
+-		slot = next_slot(ring, slot);
++		/* One slot per MPDU */
+ 		ops->idx2desc(ring, slot, &meta);
+ 		if (unlikely(!meta->skb || b43_dma_ptr_is_poisoned(meta->skb))) {
+ 			b43dbg(dev->wl, "A-MPDU TX status: no frame at slot %d on ring %d\n",
+ 			       slot, ring->index);
+ 			break;
+ 		}
++		last = (le32_to_cpu(b43_dma_txhdr(ring, slot)->mac_ctl) &
++			B43_TXH_MAC_AMPDU) == B43_TXH_MAC_AMPDU_LAST;
++		b43_dma_tx_unmap(ring, meta);
+ 		if (!len++) {
+ 			struct ieee80211_hdr *hdr =
+ 				(struct ieee80211_hdr *)meta->skb->data;
+@@ -1954,9 +1959,7 @@ static void b43_dma_handle_ampdu_txstatu
+ 			first = *IEEE80211_SKB_CB(meta->skb);
+ 			sta = ieee80211_find_sta_by_ifaddr(dev->wl->hw,
+ 							   hdr->addr1, NULL);
+-			tid = b43_airtime_tid(hdr);
+ 		}
+-		bytes += meta->skb->len;
+ 		if (b43_dma_complete_ampdu_frame(dev, ring, meta, status,
+ 						 &retry))
+ 			acked++;
+@@ -2010,12 +2013,12 @@ void b43_dma_handle_txstatus(struct b43_
+ 		/* This possibly is a firmware bug and will result in
+ 		 * malfunction, memory leaks and/or stall of DMA functionality.
+ 		 */
+-		if (slot == next_slot(ring, next_slot(ring, firstused))) {
++		if (slot == next_slot(ring, firstused)) {
+ 			/* If a single header/data pair was missed, skip over
+ 			 * the first two slots in an attempt to recover.
+ 			 */
+ 			slot = firstused;
+-			skip = 2;
++			skip = 1;
+ 			if (!err_out1) {
+ 				/* Report the error once. */
+ 				b43dbg(dev->wl,
+@@ -2059,13 +2062,7 @@ void b43_dma_handle_txstatus(struct b43_
+ 		}
+ 
+ 		if (meta->skb) {
+-			struct b43_private_tx_info *priv_info =
+-			     b43_get_priv_tx_info(IEEE80211_SKB_CB(meta->skb));
+-
+-			unmap_descbuffer(ring, meta->dmaaddr,
+-					 meta->skb->len, 1);
+-			kfree(priv_info->bouncebuffer);
+-			priv_info->bouncebuffer = NULL;
++			b43_dma_tx_unmap(ring, meta);
+ 		} else {
+ 			unmap_descbuffer(ring, meta->dmaaddr,
+ 					 b43_txhdr_size(dev), 1);
+--- a/drivers/net/wireless/broadcom/b43/dma.h
++++ b/drivers/net/wireless/broadcom/b43/dma.h
+@@ -192,6 +192,8 @@ struct b43_dmadesc_meta {
+ 	dma_addr_t dmaaddr;
+ 	/* ieee80211 TX status. Only used once per 802.11 frag. */
+ 	bool is_last_fragment;
++	/* The TX header is in front of the frame, in the skb headroom */
++	bool hdr_pushed;
+ };
+ 
+ struct b43_dmaring;
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -6777,6 +6777,8 @@ static struct b43_wl *b43_wireless_init(
+ 	ieee80211_hw_set(hw, MFP_CAPABLE);
+ 	ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+ 	ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
++	/* Room for the TX header in front of the frame (one DMA descriptor) */
++	hw->extra_tx_headroom = sizeof(struct b43_txhdr);
+ 	hw->max_tx_aggregation_subframes = B43_AMPDU_MAX_FRAMES;
+ 	hw->sta_data_size = sizeof(struct b43_sta);
+ 	hw->wiphy->interface_modes =
