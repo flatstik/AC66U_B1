@@ -1,0 +1,747 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ville Takio <ville+git@takio.fi>
+Date: Wed, 11 Nov 2026 16:00:00 +0200
+Subject: [PATCH] wifi: b43: AC-PHY: send and receive outside the softirq
+
+On a BCM4708 (two Cortex-A9 cores, DMA without cache coherency), the AC
+cores lost a fifth of their 5 GHz throughput on the NAPI and direct TX
+paths: 316-347 Mbit/s from the AP to a two-stream phone on an RT-AC56U,
+against 397-421 before the N/HT series. Three costs added up:
+
+- the 128-byte TX header in the headroom: frames bridged from bgmac have
+  less, and each one was reallocated and copied (28857 of 28857 in a
+  two-second sample);
+- A-MSDUs copied into one buffer: about 15 us to map one, against 9 us
+  for one mapped in place;
+- one core: b43's RX, TX status and most of the TX posting ran in the
+  softirq of the core that takes the interrupt, while the other kept a
+  quarter idle.
+
+For the AC cores only:
+
+- b43_tx_direct() is false: RX and TX status run in the interrupt
+  thread, TX in tx_work, and the received frames and the TX statuses go
+  to mac80211 once the thread has dropped wl->mutex (b43_rx_deliver());
+- the TX header takes a descriptor of its own, as below core rev 30, and
+  mac80211 is asked for no headroom;
+- A-MSDUs stay on their frag_list (TX_FRAG_LIST), a descriptor for each
+  subframe;
+- frames are pulled from the TXQs in tx_work, as long as the ring has
+  room, so that mac80211 builds A-MSDUs of the ones that wait;
+- RX syncs the header first and then the frame's length, from buffers
+  mapped DMA_FROM_DEVICE, three to a page pool page: the poison of
+  b43_poison_rx_buffer() no longer reaches memory on these cores;
+- no airtime fairness, whose airtime estimate per frame costs about a
+  twentieth of the throughput.
+
+RT-AC56U (BCM4352, ch 36/80, Nord 2 2x2 at -44 dBm, TCP -P4), alternated
+with the module before the N/HT series: 398-401 Mbit/s down and 384-392
+up, against 410-419 and 402-409. RT-AC66U B1 (BCM4360, server on the
+router): 336-338 down and 213-215 up, against 347-351 and 203.
+
+Signed-off-by: Ville Takio <ville+git@takio.fi>
+---
+ drivers/net/wireless/broadcom/b43/b43.h  |  11 +-
+ drivers/net/wireless/broadcom/b43/dma.c  | 212 ++++++++++++++++++++++++---
+ drivers/net/wireless/broadcom/b43/dma.h  |  24 ++-
+ drivers/net/wireless/broadcom/b43/main.c |  97 ++++++++++--
+ drivers/net/wireless/broadcom/b43/xmit.c |   8 +-
+ 5 files changed, 319 insertions(+), 33 deletions(-)
+
+--- a/drivers/net/wireless/broadcom/b43/b43.h
++++ b/drivers/net/wireless/broadcom/b43/b43.h
+@@ -1272,6 +1272,14 @@ struct b43_wl {
+ 	/* Queue of packets to be transmitted. */
+ 	struct sk_buff_head tx_queue[B43_QOS_QUEUE_NUM];
+ 
++	/*
++	 * AC: received frames and sent frames whose TX status is known,
++	 * handed to mac80211 by b43_rx_deliver() once the interrupt thread
++	 * has dropped wl->mutex.
++	 */
++	struct sk_buff_head rx_queue;
++	struct sk_buff_head txstatus_queue;
++
+ 	/* Flag that implement the queues stopping. */
+ 	bool tx_queue_stopped[B43_QOS_QUEUE_NUM];
+ 	/* The mac80211 queue is stopped as tx_queue is full */
+@@ -1457,7 +1465,8 @@ static inline bool b43_using_pio_transfe
+ static inline bool b43_tx_direct(struct b43_wldev *dev)
+ {
+ 	return !b43_using_pio_transfers(dev) &&
+-	       !b43_bus_host_is_sdio(dev->dev);
++	       !b43_bus_host_is_sdio(dev->dev) &&
++	       dev->phy.type != B43_PHYTYPE_AC;
+ }
+ 
+ /*
+--- a/drivers/net/wireless/broadcom/b43/dma.c
++++ b/drivers/net/wireless/broadcom/b43/dma.c
+@@ -40,6 +40,30 @@ static inline int tx_slots_per_frame(str
+ 	return ring->txhdr_in_skb ? 1 : 2;
+ }
+ 
++/* The most slots one frame takes, what the ring keeps free while it runs */
++static inline int tx_slots_max(struct b43_dmaring *ring)
++{
++	if (ring->tx_frag_list)
++		return tx_slots_per_frame(ring) - 1 + B43_TX_MAX_FRAGS;
++	return tx_slots_per_frame(ring);
++}
++
++/*
++ * The txhdr_cache entry of the frame whose first slot is @slot: one per
++ * frame on the other rings, one per slot where frames take a varying number
++ * of slots.
++ */
++static inline int txhdr_index(struct b43_dmaring *ring, int slot)
++{
++	return ring->tx_frag_list ? slot : slot / tx_slots_per_frame(ring);
++}
++
++static inline int txhdr_entries(struct b43_dmaring *ring)
++{
++	return ring->tx_frag_list ? ring->nr_slots :
++	       ring->nr_slots / tx_slots_per_frame(ring);
++}
++
+ static u32 b43_dma_address(struct b43_dma *dma, dma_addr_t dmaaddr,
+ 			   enum b43_addrtype addrtype)
+ {
+@@ -393,7 +417,7 @@ static inline
+ {
+ 	B43_WARN_ON(ring->tx);
+ 	dma_sync_single_for_cpu(ring->dev->dev->dma_dev,
+-				    addr, len, DMA_BIDIRECTIONAL);
++				    addr, len, ring->rx_dir);
+ }
+ 
+ static inline
+@@ -402,7 +426,7 @@ static inline
+ {
+ 	B43_WARN_ON(ring->tx);
+ 	dma_sync_single_for_device(ring->dev->dev->dma_dev,
+-				   addr, len, DMA_BIDIRECTIONAL);
++				   addr, len, ring->rx_dir);
+ }
+ 
+ static inline
+@@ -663,17 +687,26 @@ static int b43_rx_page_pool_create(struc
+ 	struct page_pool_params pp_params = {};
+ 	struct page_pool *pp;
+ 
+-	/* With room for the A-MSDUs of HT, a buffer takes two 4 KiB pages */
+-	pp_params.order = get_order(b43_rx_truesize(ring));
++	/*
++	 * With room for the A-MSDUs of HT, a buffer takes two 4 KiB pages.
++	 * The AC's take three buffers to a pool page, as #26349 did: one
++	 * 8 KiB page per 3.9 KB buffer doubles every frame's truesize, and a
++	 * TCP receiver on the router itself ran out of its socket budget
++	 * (RT-AC66U B1: 161 against 212 Mbit/s upload).
++	 */
++	pp_params.order = get_order((ring->rx_dir == DMA_FROM_DEVICE ? 3 : 1) *
++				    b43_rx_truesize(ring));
+ 	pp_params.pool_size = ring->nr_slots;
+ 	pp_params.nid = NUMA_NO_NODE;
+ 	pp_params.dev = ring->dev->dev->dma_dev;
+ 	/*
+ 	 * Not DMA_FROM_DEVICE: on a non-coherent CPU, the sync for the
+ 	 * device would then only invalidate the cache, and the poison of
+-	 * b43_poison_rx_buffer() would never reach memory.
++	 * b43_poison_rx_buffer() would never reach memory. The AC gives that
++	 * up: the clean takes a twentieth of its throughput on a BCM4708, and
++	 * its engine reports only the descriptors it filled (b43_dma_rx()).
+ 	 */
+-	pp_params.dma_dir = DMA_BIDIRECTIONAL;
++	pp_params.dma_dir = ring->rx_dir;
+ 	pp_params.flags = PP_FLAG_DMA_MAP;
+ 
+ 	pp = page_pool_create(&pp_params);
+@@ -885,7 +918,7 @@ static void b43_dma_tx_unmap(struct b43_
+ 	struct b43_private_tx_info *priv_info =
+ 		b43_get_priv_tx_info(IEEE80211_SKB_CB(skb));
+ 
+-	unmap_descbuffer(ring, meta->dmaaddr, skb->len, 1);
++	unmap_descbuffer(ring, meta->dmaaddr, meta->len ?: skb->len, 1);
+ 	kfree(priv_info->bouncebuffer);
+ 	priv_info->bouncebuffer = NULL;
+ 	if (meta->hdr_pushed) {
+@@ -907,6 +940,12 @@ static void free_all_descbuffers(struct
+ 
+ 		if (!meta->skb || b43_dma_ptr_is_poisoned(meta->skb)) {
+ 			B43_WARN_ON(!ring->tx);
++			/* A frag_list buffer ahead of the frame's last slot */
++			if (!meta->skb && meta->len) {
++				unmap_descbuffer(ring, meta->dmaaddr,
++						 meta->len, 1);
++				meta->len = 0;
++			}
+ 			continue;
+ 		}
+ 		if (ring->tx)
+@@ -987,7 +1026,10 @@ struct b43_dmaring *b43_setup_dmaring(st
+ 		ring->tx = true;
+ 		ring->current_slot = -1;
+ 		ring->txhdr_in_skb = b43_dma_txhdr_in_skb(dev->dev);
++		ring->tx_frag_list = dev->fw.hdr_format == B43_FW_HDR_AC;
+ 	} else {
++		ring->rx_dir = dev->fw.hdr_format == B43_FW_HDR_AC ?
++			       DMA_FROM_DEVICE : DMA_BIDIRECTIONAL;
+ 		if (ring->index == 0) {
+ 			switch (dev->fw.hdr_format) {
+ 			case B43_FW_HDR_AC:
+@@ -1019,7 +1061,7 @@ struct b43_dmaring *b43_setup_dmaring(st
+ 		/* Assumption: B43_TXRING_SLOTS can be divided by the slots per frame */
+ 		BUILD_BUG_ON(B43_TXRING_SLOTS % 2 != 0);
+ 
+-		ring->txhdr_cache = kcalloc(ring->nr_slots / tx_slots_per_frame(ring),
++		ring->txhdr_cache = kcalloc(txhdr_entries(ring),
+ 					    b43_txhdr_size(dev),
+ 					    GFP_KERNEL);
+ 		if (!ring->txhdr_cache)
+@@ -1035,7 +1077,7 @@ struct b43_dmaring *b43_setup_dmaring(st
+ 					  b43_txhdr_size(dev), 1)) {
+ 			/* ugh realloc */
+ 			kfree(ring->txhdr_cache);
+-			ring->txhdr_cache = kcalloc(ring->nr_slots / tx_slots_per_frame(ring),
++			ring->txhdr_cache = kcalloc(txhdr_entries(ring),
+ 						    b43_txhdr_size(dev),
+ 						    GFP_KERNEL | GFP_DMA);
+ 			if (!ring->txhdr_cache)
+@@ -1354,6 +1396,83 @@ struct b43_dmaring *parse_cookie(struct
+ 	return ring;
+ }
+ 
++/*
++ * Map an A-MSDU that mac80211 left on its frag_list (TX_FRAG_LIST) without
++ * copying it: the head, with the TX header pushed in front, in the slot
++ * dma_tx_fragment() took, and each subframe in a slot of its own. The last
++ * slot carries the skb, the others the length they mapped. Copying each
++ * A-MSDU into one buffer cost the BCM4708 a sixth of a core at 330 Mbit/s
++ * on the RT-AC56U: the copy itself, and writing the copy back from the
++ * cache to map it.
++ *
++ * Returns the last slot, or a negative error with the ring as it was after
++ * the first slot; the caller then linearizes the frame.
++ */
++static int dma_tx_map_frag_list(struct b43_dmaring *ring, struct sk_buff *skb,
++				int slot, struct b43_dmadesc_generic *desc,
++				struct b43_dmadesc_meta *meta, bool start)
++{
++	const struct b43_dma_ops *ops = ring->ops;
++	struct b43_dmadesc_meta *first = meta;
++	int top_slot = ring->current_slot, used = ring->used_slots;
++	struct sk_buff *frag = NULL, *next;
++	unsigned int len = skb_headlen(skb), n = 1;
++	int first_slot = slot;
++	void *data = skb->data;
++	bool pushed;
++
++	skb_walk_frags(skb, next) {
++		if (skb_shinfo(next)->nr_frags)
++			return -EINVAL;
++		n++;
++	}
++	if (skb_shinfo(skb)->nr_frags || n > B43_TX_MAX_FRAGS ||
++	    free_slots(ring) < n - 1)
++		return -EINVAL;
++
++	pushed = first->hdr_pushed;
++	first->hdr_pushed = false;
++	first->skb = NULL;
++	first->is_last_fragment = false;
++	for (;;) {
++		next = frag ? frag->next : skb_shinfo(skb)->frag_list;
++		meta->dmaaddr = map_descbuffer(ring, data, len, 1);
++		if (b43_dma_mapping_error(ring, meta->dmaaddr, len, 1))
++			goto unwind;
++		meta->len = len;
++		ops->fill_descriptor(ring, desc, meta->dmaaddr, len,
++				     start && slot == first_slot, !next, !next);
++		if (!next)
++			break;
++		frag = next;
++		data = frag->data;
++		len = frag->len;
++		slot = request_slot(ring);
++		desc = ops->idx2desc(ring, slot, &meta);
++		memset(meta, 0, sizeof(*meta));
++	}
++	meta->skb = skb;
++	meta->is_last_fragment = true;
++	meta->hdr_pushed = pushed;
++	return slot;
++
++unwind:
++	for (; slot != first_slot; slot = prev_slot(ring, slot)) {
++		ops->idx2desc(ring, slot, &meta);
++		memset(meta, 0, sizeof(*meta));
++		ops->idx2desc(ring, prev_slot(ring, slot), &meta);
++		if (meta->len)
++			unmap_descbuffer(ring, meta->dmaaddr, meta->len, 1);
++	}
++	ring->current_slot = top_slot;
++	ring->used_slots = used;
++	memset(first, 0, sizeof(*first));
++	first->skb = skb;
++	first->is_last_fragment = true;
++	first->hdr_pushed = pushed;
++	return -EIO;
++}
++
+ static int dma_tx_fragment(struct b43_dmaring *ring,
+ 			   struct sk_buff *skb, bool poke)
+ {
+@@ -1386,7 +1505,7 @@ static int dma_tx_fragment(struct b43_dm
+ 	desc = ops->idx2desc(ring, slot, &meta);
+ 	memset(meta, 0, sizeof(*meta));
+ 
+-	header = &ring->txhdr_cache[(slot / tx_slots_per_frame(ring)) * hdrsize];
++	header = &ring->txhdr_cache[txhdr_index(ring, slot) * hdrsize];
+ 	cookie = generate_cookie(ring, slot);
+ 	err = b43_generate_txhdr(ring->dev, header, skb, info, cookie);
+ 	if (unlikely(err))
+@@ -1418,6 +1537,20 @@ static int dma_tx_fragment(struct b43_dm
+ 	meta->is_last_fragment = true;
+ 	priv_info->bouncebuffer = NULL;
+ 
++	if (ring->tx_frag_list && skb_has_frag_list(skb)) {
++		int last = dma_tx_map_frag_list(ring, skb, slot, desc, meta,
++						!meta_hdr);
++
++		if (last >= 0) {
++			slot = last;
++			goto mapped;
++		}
++		if (skb_linearize(skb)) {
++			err = -ENOMEM;
++			goto out_undo;
++		}
++	}
++
+ 	meta->dmaaddr = map_descbuffer(ring, skb->data, skb->len, 1);
+ 	/* create a bounce buffer in zone_dma on mapping failure. */
+ 	if (b43_dma_mapping_error(ring, meta->dmaaddr, skb->len, 1)) {
+@@ -1439,6 +1572,7 @@ static int dma_tx_fragment(struct b43_dm
+ 
+ 	ops->fill_descriptor(ring, desc, meta->dmaaddr, skb->len,
+ 			     !meta_hdr, 1, 1);
++mapped:
+ 
+ 	if (info->flags & IEEE80211_TX_CTL_SEND_AFTER_DTIM) {
+ 		/* Tell the firmware about the cookie of the last
+@@ -1520,6 +1654,20 @@ static struct b43_dmaring *select_ring_b
+ 	return ring;
+ }
+ 
++/*
++ * Whether the ring of @queue_prio has room for the @waiting frames that wait
++ * in tx_queue to be posted, and for one more.
++ */
++bool b43_dma_tx_room(struct b43_wldev *dev, u8 queue_prio,
++		     unsigned int waiting)
++{
++	struct b43_dmaring *ring = select_ring_by_priority(dev, queue_prio);
++
++	return !ring->stopped &&
++	       free_slots(ring) >= waiting * tx_slots_per_frame(ring) +
++				   tx_slots_max(ring);
++}
++
+ int b43_dma_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ {
+ 	struct b43_dmaring *ring;
+@@ -1553,7 +1701,7 @@ int b43_dma_tx(struct b43_wldev *dev, st
+ 		goto out;
+ 	}
+ 
+-	if (WARN_ON(free_slots(ring) < tx_slots_per_frame(ring))) {
++	if (WARN_ON(free_slots(ring) < tx_slots_max(ring))) {
+ 		/* If we get here, we have a real error with the queue
+ 		 * full, but queues not stopped. */
+ 		b43err(dev->wl, "DMA queue overflow\n");
+@@ -1578,7 +1726,7 @@ int b43_dma_tx(struct b43_wldev *dev, st
+ 		b43err(dev->wl, "DMA tx mapping failure\n");
+ 		goto out;
+ 	}
+-	if ((free_slots(ring) < tx_slots_per_frame(ring)) ||
++	if ((free_slots(ring) < tx_slots_max(ring)) ||
+ 	    should_inject_overflow(ring)) {
+ 		/* This TX ring is full. */
+ 		unsigned int skb_mapping = b43_tx_queue_num(dev, skb);
+@@ -1612,7 +1760,7 @@ static struct b43_txhdr *b43_dma_txhdr(s
+ 		return (struct b43_txhdr *)meta->skb->data;
+ 	}
+ 	return (struct b43_txhdr *)
+-		&ring->txhdr_cache[(slot / tx_slots_per_frame(ring)) * hdrsize];
++		&ring->txhdr_cache[txhdr_index(ring, slot) * hdrsize];
+ }
+ 
+ static void b43_dma_sync_txhdr(struct b43_dmaring *ring, int slot)
+@@ -2206,7 +2354,7 @@ static bool b43_dma_tx_missed(struct b43
+ 		}
+ 		if (!meta->skb) {
+ 			unmap_descbuffer(ring, meta->dmaaddr,
+-					 b43_txhdr_size(dev), 1);
++					 meta->len ?: b43_txhdr_size(dev), 1);
+ 			ring->used_slots--;
+ 			continue;
+ 		}
+@@ -2274,7 +2422,7 @@ dma_handle_txstatus_one(struct b43_wldev
+ 		if (missed < 0)
+ 			missed += ring->nr_slots;
+ 		if (missed < ring->used_slots &&
+-		    !(missed % tx_slots_per_frame(ring)) &&
++		    (ring->tx_frag_list || !(missed % tx_slots_per_frame(ring))) &&
+ 		    (!dev->fw.opensource || missed == tx_slots_per_frame(ring))) {
+ 			/*
+ 			 * The status of the frames ahead of this one was
+@@ -2330,8 +2478,9 @@ dma_handle_txstatus_one(struct b43_wldev
+ 		if (meta->skb) {
+ 			b43_dma_tx_unmap(ring, meta);
+ 		} else {
++			/* A header slot, or a buffer of a frag_list */
+ 			unmap_descbuffer(ring, meta->dmaaddr,
+-					 b43_txhdr_size(dev), 1);
++					 meta->len ?: b43_txhdr_size(dev), 1);
+ 		}
+ 
+ 		if (meta->is_last_fragment) {
+@@ -2377,7 +2526,13 @@ dma_handle_txstatus_one(struct b43_wldev
+ 				ring->nr_failed_tx_packets++;
+ 			ring->nr_total_packet_tries += status->frame_count;
+ #endif /* DEBUG */
+-			ieee80211_tx_status_skb(dev->wl->hw, meta->skb);
++			if (dev->fw.hdr_format == B43_FW_HDR_AC &&
++			    !b43_tx_direct(dev))
++				/* b43_rx_deliver() reports it */
++				skb_queue_tail(&dev->wl->txstatus_queue,
++					       meta->skb);
++			else
++				ieee80211_tx_status_skb(dev->wl->hw, meta->skb);
+ 
+ 			/* skb will be freed by ieee80211_tx_status_skb().
+ 			 * Poison our pointer. */
+@@ -2406,7 +2561,10 @@ dma_handle_txstatus_one(struct b43_wldev
+ 	}
+ out_wake:
+ 	if (ring->stopped) {
+-		B43_WARN_ON(free_slots(ring) < tx_slots_per_frame(ring));
++		/* A frag_list frame may need more than this status freed */
++		if (ring->tx_frag_list && free_slots(ring) < tx_slots_max(ring))
++			return ring;
++		B43_WARN_ON(free_slots(ring) < tx_slots_max(ring));
+ 		ring->stopped = false;
+ 	}
+ 
+@@ -2463,6 +2621,14 @@ static void b43_dma_rx_recycle(struct b4
+ 	sync_descbuffer_for_device(ring, meta->dmaaddr, ring->rx_buffersize);
+ }
+ 
++/* What dma_rx() syncs before it reads the frame length */
++static size_t b43_rx_sync_head(struct b43_dmaring *ring)
++{
++	if (ring->rx_dir == DMA_FROM_DEVICE)
++		return ring->frameoffset + sizeof(struct b43_plcp_hdr6) + 2;
++	return ring->rx_buffersize;
++}
++
+ static void dma_rx(struct b43_dmaring *ring, int slot,
+ 		   struct napi_struct *napi)
+ {
+@@ -2477,7 +2643,11 @@ static void dma_rx(struct b43_dmaring *r
+ 
+ 	desc = ops->idx2desc(ring, slot, &meta);
+ 
+-	sync_descbuffer_for_cpu(ring, meta->dmaaddr, ring->rx_buffersize);
++	/*
++	 * The AC syncs the RX header and the poison first, and the frame once
++	 * its length is known, instead of the whole 3.9 KB buffer.
++	 */
++	sync_descbuffer_for_cpu(ring, meta->dmaaddr, b43_rx_sync_head(ring));
+ 	skb = meta->skb;
+ 
+ 	rxhdr = (struct b43_rxhdr_fw4 *)skb->data;
+@@ -2488,6 +2658,8 @@ static void dma_rx(struct b43_dmaring *r
+ 		do {
+ 			udelay(2);
+ 			barrier();
++			sync_descbuffer_for_cpu(ring, meta->dmaaddr,
++						b43_rx_sync_head(ring));
+ 			len = le16_to_cpu(rxhdr->frame_len);
+ 		} while (len == 0 && i++ < 5);
+ 		if (unlikely(len == 0)) {
+@@ -2528,6 +2700,8 @@ static void dma_rx(struct b43_dmaring *r
+ 		goto drop_recycle_buffer;
+ 	}
+ 
++	if (b43_rx_sync_head(ring) < ring->rx_buffersize)
++		sync_descbuffer_for_cpu(ring, dmaaddr, len + ring->frameoffset);
+ 	skb_put(skb, len + ring->frameoffset);
+ 	skb_pull(skb, ring->frameoffset);
+ 
+--- a/drivers/net/wireless/broadcom/b43/dma.h
++++ b/drivers/net/wireless/broadcom/b43/dma.h
+@@ -222,6 +222,13 @@ struct b43_dmadesc_meta {
+ 	bool hdr_pushed;
+ };
+ 
++/*
++ * Most buffers of one TX frame on a ring with tx_frag_list (mac80211's
++ * max_tx_fragments): the head of an A-MSDU, with the TX header in front of
++ * it, and the subframes on its frag_list, each in a slot of its own.
++ */
++#define B43_TX_MAX_FRAGS	8
++
+ struct b43_dmaring;
+ 
+ /* Lowlevel DMA operations that differ between 32bit and 64bit DMA. */
+@@ -290,6 +297,13 @@ struct b43_dmaring {
+ 	bool tx;
+ 	/* The TX header goes in front of the frame, in one descriptor */
+ 	bool txhdr_in_skb;
++	/* A frame may take a slot per buffer of its frag_list (AC A-MSDUs) */
++	bool tx_frag_list;
++	/*
++	 * RX: the AC's buffers are mapped DMA_FROM_DEVICE, the other cores'
++	 * DMA_BIDIRECTIONAL (b43_rx_page_pool_create())
++	 */
++	enum dma_data_direction rx_dir;
+ 	/* The type of DMA engine used. */
+ 	enum b43_dmatype type;
+ 	/* Boolean. Is this ring stopped at ieee80211 level? */
+@@ -333,7 +347,13 @@ static inline void b43_dma_write(struct
+  */
+ static inline bool b43_dma_txhdr_in_skb(struct b43_bus_dev *dev)
+ {
+-	return dev->core_rev >= 30;
++	/*
++	 * The AC cores take the header in a slot of their own, as their
++	 * stock driver's descriptor rings show: frames bridged from bgmac
++	 * have no room for its 128 bytes in front, and mac80211 would copy
++	 * every one of them to make it.
++	 */
++	return dev->core_rev >= 30 && dev->core_rev < 40;
+ }
+ 
+ int b43_dma_init(struct b43_wldev *dev);
+@@ -343,6 +363,8 @@ void b43_dma_tx_suspend(struct b43_wldev
+ void b43_dma_tx_resume(struct b43_wldev *dev);
+ 
+ bool b43_dma_ampdu_busy(struct b43_wldev *dev, struct sk_buff *skb);
++bool b43_dma_tx_room(struct b43_wldev *dev, u8 queue_prio,
++		     unsigned int waiting);
+ enum b43_ampdu_window {
+ 	B43_AMPDU_IN_WINDOW,
+ 	B43_AMPDU_AHEAD,	/* Not yet: the window is full */
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -3153,6 +3153,34 @@ static bool b43_irq_for_napi(struct b43_
+ 	return true;
+ }
+ 
++/*
++ * Hand the frames and TX statuses the AC queued in the interrupt thread to
++ * mac80211, after the thread has dropped wl->mutex: mac80211 passes each
++ * frame on through the bridge or the IP stack from here, and with the mutex
++ * held that kept b43_tx_work() waiting for as long as the receive path ran.
++ * The interrupt thread is the only caller, so the RX calls stay serialized
++ * as mac80211 requires.
++ */
++static void b43_rx_deliver(struct b43_wl *wl)
++{
++	struct sk_buff *skb;
++	LIST_HEAD(list);
++
++	if (skb_queue_empty(&wl->rx_queue) &&
++	    skb_queue_empty(&wl->txstatus_queue))
++		return;
++
++	local_bh_disable();
++	while ((skb = skb_dequeue(&wl->txstatus_queue)))
++		ieee80211_tx_status_skb(wl->hw, skb);
++	rcu_read_lock();
++	while ((skb = skb_dequeue(&wl->rx_queue)))
++		ieee80211_rx_list(wl->hw, NULL, skb, &list);
++	rcu_read_unlock();
++	netif_receive_skb_list(&list);
++	local_bh_enable();
++}
++
+ /* Interrupt thread handler. Handles device interrupts in thread context. */
+ static irqreturn_t b43_interrupt_thread_handler(int irq, void *dev_id)
+ {
+@@ -3161,6 +3189,7 @@ static irqreturn_t b43_interrupt_thread_
+ 	mutex_lock(&dev->wl->mutex);
+ 	b43_do_interrupt_thread(dev);
+ 	mutex_unlock(&dev->wl->mutex);
++	b43_rx_deliver(dev->wl);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -5328,23 +5357,45 @@ static void b43_tx_kick(struct b43_wl *w
+ static bool b43_pull_txqs(struct b43_wl *wl, u8 ac)
+ {
+ 	struct ieee80211_hw *hw = wl->hw;
++	struct b43_wldev *dev = READ_ONCE(wl->current_dev);
+ 	struct ieee80211_txq *txq;
+ 	struct sk_buff *skb;
+-	bool send = false;
++	bool send = false, full = false;
++	/*
++	 * The AC microcode builds its A-MPDUs of what is on the ring. Take
++	 * only what fits there and leave the rest in mac80211, which builds
++	 * A-MSDUs of the frames that wait (TX_AMSDU); the next TX status
++	 * pulls again. Taking everything at once, the RT-AC56U's BCM4352 sent
++	 * 9-10 MPDUs per A-MPDU, 62% of them A-MSDUs, and 330 Mbit/s to a
++	 * two-stream phone, against 23-24, 99% and 418.
++	 */
++	bool ring_gated = dev && dev->phy.type == B43_PHYTYPE_AC &&
++			  !b43_using_pio_transfers(dev);
+ 
+ 	spin_lock_bh(&wl->txq_lock);
+ 	ieee80211_txq_schedule_start(hw, ac);
+-	while ((txq = ieee80211_next_txq(hw, ac))) {
++	while (!full && (txq = ieee80211_next_txq(hw, ac))) {
+ 		struct ieee80211_tx_control control = {
+ 			.sta = txq->sta,
+ 		};
+ 
+-		while ((skb = ieee80211_tx_dequeue(hw, txq)))
++		while (true) {
++			full = ring_gated &&
++			       !b43_dma_tx_room(dev, ac,
++						skb_queue_len(&wl->tx_queue[ac]));
++			if (full)
++				break;
++			skb = ieee80211_tx_dequeue(hw, txq);
++			if (!skb)
++				break;
+ 			send |= b43_tx_enqueue(wl, &control, skb);
++		}
+ 		ieee80211_return_txq(hw, txq, false);
+ 	}
+ 	ieee80211_txq_schedule_end(hw, ac);
+ 	spin_unlock_bh(&wl->txq_lock);
++	if (full)
++		set_bit(ac, &wl->txq_pull);
+ 
+ 	return send;
+ }
+@@ -5359,6 +5410,13 @@ static void b43_op_wake_tx_queue(struct
+ 		/* b43_do_tx_work() takes them */
+ 		set_bit(txq->ac, &wl->txq_pull);
+ 		b43_tx_kick(wl);
++	} else if (dev && dev->phy.type == B43_PHYTYPE_AC) {
++		/*
++		 * b43_tx_work() takes them, as many as the ring has room
++		 * for: what waits meanwhile, mac80211 builds A-MSDUs of.
++		 */
++		set_bit(txq->ac, &wl->txq_pull);
++		ieee80211_queue_work(hw, &wl->tx_work);
+ 	} else if (b43_pull_txqs(wl, txq->ac)) {
+ 		ieee80211_queue_work(hw, &wl->tx_work);
+ 	}
+@@ -5692,8 +5750,12 @@ static void b43_tx_status_irq(struct b43
+ 	if (direct)
+ 		b43_tx_lock(wl);
+ 	handle_irq_transmit_status(dev);
+-	if (READ_ONCE(wl->txq_pull))
+-		b43_do_tx_work(dev);
++	if (READ_ONCE(wl->txq_pull)) {
++		if (dev->phy.type == B43_PHYTYPE_AC)
++			ieee80211_queue_work(wl->hw, &wl->tx_work);
++		else
++			b43_do_tx_work(dev);
++	}
+ 	if (direct)
+ 		b43_tx_unlock(wl);
+ }
+@@ -7007,6 +7069,8 @@ redo:
+ 			ieee80211_free_txskb(wl->hw, skb);
+ 		}
+ 	}
++	skb_queue_purge(&wl->rx_queue);
++	ieee80211_purge_tx_queue(wl->hw, &wl->txstatus_queue);
+ 
+ 	b43_mac_suspend(dev);
+ 	b43_leds_exit(dev);
+@@ -8637,12 +8701,17 @@ static int b43_setup_bands(struct b43_wl
+ 		hw->wiphy->bands[NL80211_BAND_2GHZ] = band;
+ 	}
+ 	if (dev->phy.type == B43_PHYTYPE_AC) {
++		/*
++		 * No airtime fairness on the AC: estimating and registering
++		 * every frame's airtime costs a BCM4708 a twentieth of its
++		 * 5 GHz throughput, b43_tx_airtime() and b43_rx_airtime()
++		 * skip the AC, and AQL still bounds what a station has in
++		 * flight. b43_wireless_init() set it before the PHY was known.
++		 */
++		hw->wiphy->ext_features[NL80211_EXT_FEATURE_AIRTIME_FAIRNESS / 8] &=
++			~BIT(NL80211_EXT_FEATURE_AIRTIME_FAIRNESS % 8);
+ 		/* A rate and its fallbacks, a block each. */
+ 		hw->max_rates = B43_TXH_AC_RATES;
+-		/* The AC TX header, 128 bytes, goes in front of the frame */
+-		hw->extra_tx_headroom = max_t(unsigned int,
+-					      hw->extra_tx_headroom,
+-					      sizeof(struct b43_txhdr_ac));
+ 		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+ 		/*
+ 		 * A-MSDUs come in pieces, which b43_rx_amsdu() joins. They
+@@ -8655,10 +8724,14 @@ static int b43_setup_bands(struct b43_wl
+ 		/*
+ 		 * mac80211 builds A-MSDUs from what waits in its TXQs
+ 		 * (b43_pull_txqs()), on its fast transmit path only, of frames
+-		 * that are worth it (b43_op_can_aggregate_in_amsdu()), and
+-		 * copies each into one buffer: a frame takes one DMA slot.
++		 * that are worth it (b43_op_can_aggregate_in_amsdu()). The
++		 * subframes stay on the frag_list, each mapped into a slot of
++		 * its own (dma_tx_map_frag_list()), instead of being copied
++		 * into one buffer.
+ 		 */
+ 		ieee80211_hw_set(hw, TX_AMSDU);
++		ieee80211_hw_set(hw, TX_FRAG_LIST);
++		hw->max_tx_fragments = B43_TX_MAX_FRAGS;
+ 		ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
+ 		/*
+ 		 * Airtime queue limits: mac80211 estimates each frame's
+@@ -9115,6 +9188,8 @@ static struct b43_wl *b43_wireless_init(
+ 	spin_lock_init(&wl->tx_lock);
+ 
+ 	/* Initialize queues and flags. */
++	skb_queue_head_init(&wl->rx_queue);
++	skb_queue_head_init(&wl->txstatus_queue);
+ 	for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
+ 		skb_queue_head_init(&wl->tx_queue[queue_num]);
+ 		wl->tx_queue_stopped[queue_num] = false;
+--- a/drivers/net/wireless/broadcom/b43/xmit.c
++++ b/drivers/net/wireless/broadcom/b43/xmit.c
+@@ -1776,6 +1776,9 @@ static void b43_rx_airtime(struct b43_wl
+ 	struct ieee80211_sta *sta;
+ 	u32 airtime;
+ 
++	if (dev->fw.hdr_format == B43_FW_HDR_AC)
++		return;
++
+ 	if (!ieee80211_is_data(hdr->frame_control) ||
+ 	    (status->flag & (RX_FLAG_FAILED_FCS_CRC |
+ 			     RX_FLAG_FAILED_PLCP_CRC)))
+@@ -2222,6 +2225,8 @@ void b43_rx(struct b43_wldev *dev, struc
+ 	memcpy(IEEE80211_SKB_RXCB(skb), &status, sizeof(status));
+ 	if (napi)
+ 		ieee80211_rx_napi(dev->wl->hw, NULL, skb, napi);
++	else if (dev->fw.hdr_format == B43_FW_HDR_AC)
++		skb_queue_tail(&dev->wl->rx_queue, skb); /* b43_rx_deliver() */
+ 	else
+ 		ieee80211_rx_ni(dev->wl->hw, skb);
+ 
+@@ -2356,7 +2361,8 @@ void b43_tx_airtime(struct b43_wldev *de
+ 	struct ieee80211_sta *sta;
+ 	u32 airtime;
+ 
+-	if (is_multicast_ether_addr(hdr->addr1))
++	if (is_multicast_ether_addr(hdr->addr1) ||
++	    dev->fw.hdr_format == B43_FW_HDR_AC)
+ 		return;
+ 
+ 	airtime = ieee80211_calc_tx_airtime(dev->wl->hw, info, skb->len);
