@@ -8,6 +8,8 @@ PKG_CONFIG_DEPENDS += \
 	CONFIG_PACKAGE_B43_PHY_N \
 	CONFIG_PACKAGE_B43_PHY_LP \
 	CONFIG_PACKAGE_B43_PHY_HT \
+	CONFIG_PACKAGE_B43_PHY_AC \
+	CONFIG_PACKAGE_B43_DFS \
 	CONFIG_PACKAGE_B43_BUSES_BCMA_AND_SSB \
 	CONFIG_PACKAGE_B43_BUSES_BCMA \
 	CONFIG_PACKAGE_B43_BUSES_SSB \
@@ -21,6 +23,8 @@ config-$(CONFIG_PACKAGE_B43_PHY_G) += B43_PHY_G
 config-$(CONFIG_PACKAGE_B43_PHY_N) += B43_PHY_N
 config-$(CONFIG_PACKAGE_B43_PHY_LP) += B43_PHY_LP
 config-$(CONFIG_PACKAGE_B43_PHY_HT) += B43_PHY_HT
+config-$(CONFIG_PACKAGE_B43_PHY_AC) += B43_PHY_AC
+config-$(CONFIG_PACKAGE_B43_DFS) += B43_DFS
 config-$(CONFIG_PACKAGE_B43_PIO) += B43_PIO
 config-$(CONFIG_PACKAGE_B43_DEBUG) += B43_DEBUG
 
@@ -136,6 +140,7 @@ config PACKAGE_B43_USE_BCMA
 		depends on B43_FW_SQUASH
 		default "5,6,7,8,9,10,11,13,15" if TARGET_bcm47xx_legacy
 		default "16,28,29,30" if TARGET_bcm47xx_mips74k
+		default "5,6,7,8,9,10,11,13,15,16,28,29,30,42" if PACKAGE_B43_PHY_AC
 		default "5,6,7,8,9,10,11,13,15,16,28,29,30"
 		help
 		  This is a comma separated list of core revision numbers.
@@ -151,6 +156,7 @@ config PACKAGE_B43_USE_BCMA
 		depends on B43_FW_SQUASH
 		default "G,N,LP" if TARGET_bcm47xx_legacy
 		default "N,HT" if TARGET_bcm47xx_mips74k
+		default "G,N,LP,HT,AC" if PACKAGE_B43_PHY_AC
 		default "G,N,LP,HT"
 		help
 		  This is a comma separated list of PHY types:
@@ -253,6 +259,37 @@ config PACKAGE_B43_USE_BCMA
 		  Currently only 11g speed is available.
 
 		  If unsure, say Y.
+
+	config PACKAGE_B43_PHY_AC
+		bool "Enable support for AC-PHYs"
+		depends on TARGET_bcm53xx && !PACKAGE_B43_BUSES_SSB
+		select DRIVER_11AC_SUPPORT
+		default n
+		help
+		  Enable support for AC-PHY (802.11ac). This includes support for
+		  the following devices:
+		  PCI: BCM4352, BCM4360
+
+		  Experimental. Needs the bcma/ssb SROM rev 11 support, which
+		  only the bcm53xx target carries.
+
+		  If unsure, say N.
+
+	config PACKAGE_B43_DFS
+		bool "Enable DFS (radar detection) for AC-PHYs"
+		depends on PACKAGE_B43_PHY_AC
+		default n
+		help
+		  Let an AC-PHY access point use the 5 GHz channels that require
+		  radar detection: the radar detector is armed as the stock driver
+		  does, and its pulses are matched against the radar test signals
+		  of the regulatory domain's DFS region (ETSI EN 301 893 types 1-6,
+		  FCC KDB 905462 types 0-6).
+
+		  Tested on the RT-AC66U B1 with pulses from an SDR only; this is
+		  not a certified radar detector.
+
+		  If unsure, say N.
 
 	config PACKAGE_B43_PHY_LCN
 		bool "Enable support for LCN-PHYs"
