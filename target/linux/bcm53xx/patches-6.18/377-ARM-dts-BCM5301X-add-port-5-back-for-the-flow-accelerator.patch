@@ -1,0 +1,436 @@
+From: Erik Conijn <egc112@msn.com>
+Subject: [PATCH] ARM: dts: BCM5301X: add port 5 back for the flow accelerator
+
+Patch 376 makes port 8 (gmac2) the only CPU port and disables port 5
+(gmac0). Behind the flow accelerator in front of port 8, b53 needs
+port 5 as a second CPU port: it redirects the frames that the
+accelerator must not handle there (TTL or hop limit 1, TCP FIN and
+RST). The switch boots with the regular tag; with both CPU ports, the
+bcm53xx preinit hook moves it to the accelerator's prepended tag when
+flow offloading and hardware flow offloading are both on. A switch
+without the accelerator refuses that tag, and the hook keeps the
+regular one, so the change is safe on every Northstar board. User
+ports keep port 8 as their CPU port.
+
+Enable port 5 again, with a fixed link, on the boards where 376 or the
+board itself disabled it. Not on the boards where port 5 has another
+use (RT-AC87U, RT-AC88U) or where gmac0 is off (Meraki MR26, MR32), and
+not on the boards that keep port 5 as their only CPU port. The ASUS
+RT-N18U gets it from 379.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Erik Conijn <egc112@msn.com>
+---
+--- a/arch/arm/boot/dts/broadcom/bcm4708-asus-rt-ac56u.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4708-asus-rt-ac56u.dts
+@@ -149,7 +149,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4708-asus-rt-ac68u.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4708-asus-rt-ac68u.dts
+@@ -140,7 +140,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4708-buffalo-wzr-1750dhp.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4708-buffalo-wzr-1750dhp.dts
+@@ -206,7 +206,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4708-linksys-ea6300-v1.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4708-linksys-ea6300-v1.dts
+@@ -93,7 +93,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4708-linksys-ea6500-v2.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4708-linksys-ea6500-v2.dts
+@@ -92,7 +92,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4708-netgear-r6250.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4708-netgear-r6250.dts
+@@ -143,7 +143,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4708-netgear-r6300-v2.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4708-netgear-r6300-v2.dts
+@@ -135,7 +135,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4708-netgear-r6400-v1.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4708-netgear-r6400-v1.dts
+@@ -194,7 +194,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4708-smartrg-sr400ac.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4708-smartrg-sr400ac.dts
+@@ -143,7 +143,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47081-buffalo-wzr-600dhp2.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47081-buffalo-wzr-600dhp2.dts
+@@ -157,7 +157,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47081-buffalo-wzr-900dhp.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47081-buffalo-wzr-900dhp.dts
+@@ -163,7 +163,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47081-tplink-archer-c5-v2.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47081-tplink-archer-c5-v2.dts
+@@ -130,7 +130,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4709-asus-rt-ac3200.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4709-asus-rt-ac3200.dts
+@@ -149,7 +149,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4709-buffalo-wxr-1900dhp.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4709-buffalo-wxr-1900dhp.dts
+@@ -178,7 +178,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4709-linksys-ea9200.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4709-linksys-ea9200.dts
+@@ -214,7 +214,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4709-netgear-r7000.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4709-netgear-r7000.dts
+@@ -153,7 +153,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4709-netgear-r7900.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4709-netgear-r7900.dts
+@@ -76,7 +76,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm4709-netgear-r8000.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4709-netgear-r8000.dts
+@@ -224,8 +224,6 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
+-
+ 			fixed-link {
+ 				speed = <1000>;
+ 				full-duplex;
+--- a/arch/arm/boot/dts/broadcom/bcm4709-tplink-archer-c9-v1.dts
++++ b/arch/arm/boot/dts/broadcom/bcm4709-tplink-archer-c9-v1.dts
+@@ -148,7 +148,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47094-asus-rt-ac3100.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-asus-rt-ac3100.dts
+@@ -36,7 +36,10 @@
+ &srab {
+ 	ports {
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 	};
+ };
+--- a/arch/arm/boot/dts/broadcom/bcm47094-asus-rt-ac5300.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-asus-rt-ac5300.dts
+@@ -155,7 +155,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47094-dlink-dir-885l.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-dlink-dir-885l.dts
+@@ -170,7 +170,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47094-dlink-dir-890l.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-dlink-dir-890l.dts
+@@ -211,7 +211,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47094-linksys-panamera.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-linksys-panamera.dts
+@@ -259,7 +259,6 @@
+ 
+ 		port@5 {
+ 			label = "cpu";
+-			status = "disabled";
+ 
+ 			fixed-link {
+ 				speed = <1000>;
+--- a/arch/arm/boot/dts/broadcom/bcm47094-luxul-abr-4500.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-luxul-abr-4500.dts
+@@ -119,7 +119,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47094-luxul-xap-1610.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-luxul-xap-1610.dts
+@@ -103,7 +103,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47094-luxul-xbr-4500.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-luxul-xbr-4500.dts
+@@ -119,7 +119,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47094-luxul-xwr-3150-v1.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-luxul-xwr-3150-v1.dts
+@@ -150,7 +150,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47094-netgear-r8500.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-netgear-r8500.dts
+@@ -120,7 +120,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {
+--- a/arch/arm/boot/dts/broadcom/bcm47094-phicomm-k3.dts
++++ b/arch/arm/boot/dts/broadcom/bcm47094-phicomm-k3.dts
+@@ -76,7 +76,10 @@
+ 		};
+ 
+ 		port@5 {
+-			status = "disabled";
++			fixed-link {
++				speed = <1000>;
++				full-duplex;
++			};
+ 		};
+ 
+ 		port@7 {

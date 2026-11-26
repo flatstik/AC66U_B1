@@ -1,16 +1,17 @@
-# Fork only: builds the kmod-b43-next images for all the ASUS bcm53xx routers this branch supports and publishes them as a pre-release
-name: b43-next images
+# Fork only, test branch b43-next-fa: the RT-AC68U image (the RT-AC66U B1 runs it) with egc112's FA kit on top of b43-next-all,
+# kept as a workflow artifact only (untested board: no release)
+name: b43-next FA test image
 
 on:
   push:
-    branches: [b43-next-all]
+    branches: [b43-next-fa]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: b43-next-images
+  group: b43-next-fa-image
   cancel-in-progress: true
 
 jobs:
@@ -46,10 +47,10 @@ jobs:
           CONFIG_TARGET_bcm53xx_generic=y
           CONFIG_TARGET_MULTI_PROFILE=y
           CONFIG_TARGET_PER_DEVICE_ROOTFS=y
-          CONFIG_TARGET_DEVICE_bcm53xx_generic_DEVICE_asus_rt-ac56u=y
           CONFIG_TARGET_DEVICE_bcm53xx_generic_DEVICE_asus_rt-ac68u=y
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_iperf3=y
+          CONFIG_PACKAGE_irqbalance=y
           CFG
           make defconfig
           grep -E "^CONFIG_PACKAGE_(kmod-b43-next|b43-firmware[^=]*|luci)=" .config
@@ -65,21 +66,12 @@ jobs:
         run: |
           d=bin/targets/bcm53xx/generic
           mkdir out
-          cp $d/*asus_rt-ac56u*.trx $d/*asus_rt-ac68u*.trx $d/*.manifest $d/config.buildinfo $d/feeds.buildinfo $d/version.buildinfo out/ 2>/dev/null || true
+          cp $d/*asus_rt-ac68u*.trx $d/*.manifest $d/config.buildinfo $d/feeds.buildinfo $d/version.buildinfo out/ 2>/dev/null || true
           (cd out && sha256sum * > sha256sums)
           ls -la out
           echo "tag=b43-next-$(date -u +%Y%m%d)-$(git rev-parse --short=10 HEAD)" >> $GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
         with:
-          name: b43-next-images
+          name: b43-next-fa-rt-ac68u
           path: out/
-
-      - name: Pre-release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          sed -e "s/@SHA@/$(git rev-parse --short=10 HEAD)/" \
-            .github/b43-next-release.md > notes.md
-          gh release create "${{ steps.collect.outputs.tag }}" out/* --prerelease --target "$GITHUB_SHA" \
-            --title "ASUS RT-AC56U / RT-AC68U family: OpenWrt with b43-next (${{ steps.collect.outputs.tag }})" --notes-file notes.md
